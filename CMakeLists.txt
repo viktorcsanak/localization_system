@@ -20,8 +20,20 @@ target_include_directories(dw1000_driver PUBLIC
 )
 
 ##################################################################
+add_subdirectory(src/device_management)
+target_link_libraries(app PRIVATE device_management)
+target_link_libraries(device_management INTERFACE zephyr_interface)
+target_link_libraries(device_management PRIVATE kernel)
+target_include_directories(device_management PUBLIC
+    ${PROJECT_BINARY_DIR}
+    ${ZEPHYR_BASE}/kernel/include
+    ${ZEPHYR_BASE}/arch/${ARCH}/include
+)
+
+##################################################################
 
 target_include_directories(app PUBLIC
     ${PROJECT_BINARY_DIR}
     ${PROJECT_SOURCE_DIR}/src/dw1000_driver/include
+    ${PROJECT_SOURCE_DIR}/src/device_management/include
 )
