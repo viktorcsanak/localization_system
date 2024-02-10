@@ -1,5 +1,6 @@
 #include "include/device_management.h"
 #include "include/gatt_service.h"
+#include "include/device_config.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -23,10 +24,6 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(device_management, CONFIG_LOG_DEFAULT_LEVEL);
 
-#define DEVICE_ID_MAX_LENGTH 8
-#define FNV_PRIME           16777619U
-#define FNV_OFFSET_BASIS    2166136261U
-
 #define DEVICE_MANAGER_STACK_SIZE 2048
 #define DEVICE_MANAGER_PRIORITY 0
 
@@ -41,34 +38,8 @@ struct bt_conn *default_conn;
 
 static const struct bt_data advertise_data[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-    BT_DATA_BYTES(BT_DATA_UUID128_ALL, RTLS_UUID_SERVICE, RTLS_UUID_BASE),
+    BT_DATA_BYTES(BT_DATA_UUID128_ALL, DEV_MGMT_UUID_SERVICE, DEV_MGMT_UUID_BASE),
 };
-
-static uint32_t fnv_hash(const uint8_t *data, uint8_t data_length) {
-    uint32_t hash = FNV_OFFSET_BASIS;
-    for (int i = 0; i < data_length; i++) {
-        hash ^= data[i];
-        hash *= FNV_PRIME;
-    }
-
-    return hash;
-}
-
-/** @brief Read the unique device ID of the MCU and calculate its four bytes longh hash.
- * @retval 0 if failed to read device ID.
- * @retval u32 ID otherwise.
-*/
-uint32_t get_device_id(void) {
-    uint8_t device_id[DEVICE_ID_MAX_LENGTH] = {0};
-    int rc = hwinfo_get_device_id(&device_id[0], DEVICE_ID_MAX_LENGTH);
-
-    if (rc <= 0) {
-        LOG_ERR("%s: reading device ID failed or length is 0: %d", __func__, -rc);
-        return 0;
-    }
-
-    return fnv_hash(device_id, DEVICE_ID_MAX_LENGTH);
-}
 
 static void adv_stop_worker(struct k_work *item) {
     k_free(item);
@@ -98,7 +69,7 @@ K_TIMER_DEFINE(advertisement_timer, advertisement_expiry_callback, NULL);
  * @retval -ERRNO Failed
 */
 int dev_mgmt_bt_start_advertising(void) {
-    uint32_t unique_id = get_device_id();
+    uint32_t unique_id = dev_mgmt_get_config()->device_id;
     if (unique_id < 0) {
         LOG_ERR("%s: Failed to read device_id: %d", __func__, unique_id);
         return unique_id;
@@ -124,9 +95,16 @@ int dev_mgmt_bt_start_advertising(void) {
         return rc;
     }
 
-    k_timer_start(&advertisement_timer, K_SECONDS(120), K_NO_WAIT);
+    const rtls_role_t role = dev_mgmt_get_config()->rtls_role;
+    if (role != GATEWAY_ANCHOR) {
+        const uint16_t adv_duration = dev_mgmt_get_config()->adv_duration;
+        k_timer_start(&advertisement_timer, K_SECONDS(adv_duration), K_NO_WAIT);
+        LOG_INF("%s: start advertising for %d seconds", __func__, adv_duration);
+    }
+    else {
+        LOG_INF("%s: start advertising indefinitely", __func__);
+    }
 
-    LOG_INF("%s: start advertising for %d seconds", __func__, 120);
     return 0;
 }
 
