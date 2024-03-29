@@ -60,12 +60,11 @@ static int storage_iterator_perform(struct device_config *config, storage_op_t o
         struct configuration_member configuration = config_map[i];
         void *data = (uint8_t *)config + configuration.member_offset;
 
-        int rc;
+        int rc = 0;
         //Check for flash operations
         if (operation == load_config) {
             rc = nvs_read(&file_system, configuration.nvs_id, data, configuration.member_size);
-        }
-        else if (operation == save_config) {
+        } else if (operation == save_config) {
             rc = nvs_write(&file_system, configuration.nvs_id, data, configuration.member_size);
         }
 

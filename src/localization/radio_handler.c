@@ -7,6 +7,7 @@
 #include <deca_spi.h>
 #include <port.h>
 
+#include <sys/errno.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(radio_handler, CONFIG_LOG_DEFAULT_LEVEL);
@@ -16,9 +17,9 @@ LOG_MODULE_REGISTER(radio_handler, CONFIG_LOG_DEFAULT_LEVEL);
 #define FRAME_LENGTH_MAX 127
 
 /** @brief {'M', 'R', target_id[4], gateway_id[4], reserved[4], checksum[2]}*/
-#define MES_REQ_FRAME_LENGTH 16
+#define MEAS_REQ_FRAME_LENGTH 16
 /** @brief {'M', 'I', target_id[4], gateway_id[4], initiator_id[4], checksum[2]}*/
-#define MES_INIT_FRAME_LENGTH 16
+#define MEAS_INIT_FRAME_LENGTH 16
 
 static struct k_work isr_work;
 
@@ -99,8 +100,8 @@ static int send_measurement_request(const uint32_t target_id) {
     }
 
     struct tx_data *tx_data = &container->tx_data;
-    tx_data->data_length = MES_REQ_FRAME_LENGTH;
-    memset(&tx_data->tx_buffer[0], 0, MES_REQ_FRAME_LENGTH);
+    tx_data->data_length = MEAS_REQ_FRAME_LENGTH;
+    memset(&tx_data->tx_buffer[0], 0, MEAS_REQ_FRAME_LENGTH);
 
     tx_data->tx_buffer[0] = 'M';
     tx_data->tx_buffer[1] = 'R';
@@ -127,8 +128,8 @@ static int send_measurement_init(const uint32_t target_id, const uint32_t gatewa
     }
 
     struct tx_data *tx_data = &container->tx_data;
-    tx_data->data_length = MES_INIT_FRAME_LENGTH;
-    memset(&tx_data->tx_buffer[0], 0, MES_INIT_FRAME_LENGTH);
+    tx_data->data_length = MEAS_INIT_FRAME_LENGTH;
+    memset(&tx_data->tx_buffer[0], 0, MEAS_INIT_FRAME_LENGTH);
 
     tx_data->tx_buffer[0] = 'M';
     tx_data->tx_buffer[1] = 'I';
@@ -149,76 +150,89 @@ static int send_measurement_init(const uint32_t target_id, const uint32_t gatewa
     return 0;
 }
 
-static int handle_mes_init(uint32_t target_id, uint32_t gateway_id, uint32_t initiator_id) {
-    LOG_INF("%s: received mes_init from %08x requested by %08x", __func__, initiator_id, gateway_id);
+static int handle_meas_init(uint8_t *frame, uint16_t frame_length) {
+    if (MEAS_INIT_FRAME_LENGTH != frame_length) {
+        LOG_ERR("%s: read data length %d does not equal predefined %d", __func__, frame_length, MEAS_INIT_FRAME_LENGTH);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return -EINVAL;
+    }
+
+    uint32_t target_id = 0;
+    uint32_t gateway_id = 0;
+    uint32_t initiator_id = 0;
+    uint32_t device_id = dev_mgmt_get_config()->device_id;
+    memcpy(&target_id, &frame[2], sizeof(target_id));
+    if (target_id != device_id) {
+        LOG_INF("%s: received mes_init was not addressed to this device %08x vs %08x", __func__, target_id, device_id);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return -ECANCELED; 
+    }
+    memcpy(&gateway_id, &frame[6], sizeof(gateway_id));
+    memcpy(&initiator_id, &frame[10], sizeof(initiator_id));
+
+    LOG_INF("%s: received meas_init from %08x requested by %08x", __func__, initiator_id, gateway_id);
+
     return 0;
 }
 
+static int handle_meas_req(uint8_t *frame, uint16_t frame_length) {
+    if (MEAS_REQ_FRAME_LENGTH != frame_length) {
+        LOG_ERR("%s: read data length %d does not equal predefined %d", __func__, frame_length, MEAS_REQ_FRAME_LENGTH);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return -EINVAL;
+    }
+
+    uint32_t target_id = 0, gateway_id = 0;
+    memcpy(&target_id, &frame[2], sizeof(target_id));
+    memcpy(&gateway_id, &frame[6], sizeof(gateway_id));
+    return send_measurement_init(target_id, gateway_id);
+}
+
+static int handle_frame(uint8_t *frame, uint16_t frame_length) {
+    rtls_role_t role = dev_mgmt_get_config()->rtls_role;
+
+    if(frame[0] == 'M') {
+        if (role == ANCHOR) {
+            if (frame[1] == 'R') {
+                return handle_meas_req(frame, frame_length);
+            }
+        } else if (role == TAG) {
+            if (frame[1] == 'I') {
+                return handle_meas_init(frame, frame_length);
+            }
+        }
+        else {
+            LOG_WRN("%s: message type is not applicable for device", __func__);
+            return -ENOTSUP;
+        }
+    } else {
+        LOG_WRN("%s: received message is not supported", __func__);
+        return -ENOTSUP;
+    }
+}
+
 static void rx_ok_handler(const dwt_cb_data_t *cb_data) {
-    LOG_DBG("%s:", __func__);
+    uint16_t frame_length = cb_data->datalength;
+
+    if (frame_length <= 0 || frame_length > FRAME_LENGTH_MAX) {
+        LOG_ERR("%s: invalid frame length", __func__);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return;
+    }
+
     uint8_t rx_buffer[FRAME_LENGTH_MAX];
-    dwt_readrxdata(&rx_buffer[0], cb_data->datalength, 0);
+    dwt_readrxdata(&rx_buffer[0], frame_length, 0);
 
     if (0) {
-        for (int i = 0; i < cb_data->datalength; i++) {
+        for (int i = 0; i < frame_length; i++) {
             printk("%02x", rx_buffer[i]);
         }
         printk("\n");
     }
 
-    rtls_role_t role = dev_mgmt_get_config()->rtls_role;
-
-    int ret = 0;
-    if (rx_buffer[0] == 'M') {
-        if (rx_buffer[1] == 'R') {
-            if (role != ANCHOR) {
-                LOG_INF("%s: device is not an anchor, ignoring mes_req", __func__);
-                dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                return;
-            }
-            if (MES_REQ_FRAME_LENGTH != cb_data->datalength) {
-                LOG_ERR("%s: read data length %d does not equal predefined %d", __func__, cb_data->datalength, MES_REQ_FRAME_LENGTH);
-                dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                return;
-            }
-            uint32_t target_id = 0, gateway_id = 0;
-            memcpy(&target_id, &rx_buffer[2], sizeof(target_id));
-            memcpy(&gateway_id, &rx_buffer[6], sizeof(gateway_id));
-            ret = send_measurement_init(target_id, gateway_id);
-        }
-        if (rx_buffer[1] == 'I') {
-            if (role != TAG) {
-                LOG_INF("%s: device is not a tag, ignoring mes_init", __func__);
-                dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                return;
-            }
-            if (MES_INIT_FRAME_LENGTH != cb_data->datalength) {
-                LOG_ERR("%s: read data length %d does not equal predefined %d", __func__, cb_data->datalength, MES_INIT_FRAME_LENGTH);
-                dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                return;
-            }
-            uint32_t target_id = 0;
-            uint32_t gateway_id = 0;
-            uint32_t initiator_id = 0;
-            uint32_t device_id = dev_mgmt_get_config()->device_id;
-            memcpy(&target_id, &rx_buffer[2], sizeof(target_id));
-            if (target_id != device_id) {
-                LOG_INF("%s: received mes_init was not addressed to this device %08x vs %08x", __func__, target_id, device_id);
-                dwt_rxenable(DWT_START_RX_IMMEDIATE);
-                return; 
-            }
-            memcpy(&gateway_id, &rx_buffer[6], sizeof(gateway_id));
-            memcpy(&initiator_id, &rx_buffer[10], sizeof(initiator_id));
-
-            ret = handle_mes_init(target_id, gateway_id, initiator_id);
-        }
-    }
-    else {
-        LOG_INF("%s: received message is not supported", __func__);
-    }
-
+    int ret = handle_frame(&rx_buffer[0], frame_length);
     if (ret) {
-        LOG_ERR("%s: failed to handle message %d", __func__, ret);
+        LOG_WRN("%s: message was not handled", __func__);
     }
 
     dwt_rxenable(DWT_START_RX_IMMEDIATE);
@@ -244,8 +258,7 @@ int start_measurement(const uint32_t target_id) {
     if (rtls_role == TAG) {
         LOG_ERR("%s: not supported for tags", __func__);
         return -ENOTSUP;
-    }
-    else if (rtls_role == GATEWAY_ANCHOR) {
+    } else if (rtls_role == GATEWAY_ANCHOR) {
         ret = send_measurement_request(target_id);
         if (ret) {
             LOG_ERR("%s: failed to send measurement request %d", __func__, ret);
