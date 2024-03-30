@@ -79,18 +79,18 @@ static uint32_t device_id_sleep(void) {
 
 static void tx_start(struct tx_data *tx_data) {
     dwt_forcetrxoff();
-    
+
     dwt_writetxdata(tx_data->data_length, &tx_data->tx_buffer[0], 0);
-    
+
     dwt_writetxfctrl(tx_data->data_length, 0, 0);
-    
+
     dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
 }
 
 static void tx_immediate(struct k_work *item) {
     struct tx_container *container = CONTAINER_OF(item, struct tx_container, tx_work);
     struct tx_data *tx_data = &container->tx_data;
-    
+
     tx_start(tx_data);
 
     k_free(container);
@@ -99,7 +99,7 @@ static void tx_immediate(struct k_work *item) {
 static void tx_schedule(struct k_work *item) {
     struct tx_schedule_container *container = CONTAINER_OF(k_work_delayable_from_work(item), struct tx_schedule_container, tx_work);
     struct tx_data *tx_data = &container->tx_data;
-    
+
     tx_start(tx_data);
 
     k_free(container);
@@ -188,7 +188,7 @@ static void send_meas_poll(uint32_t initiator_id, uint32_t gateway_id, uint64_t 
 }
 
 static void send_meas_ans(uint32_t target_id, uint32_t gateway_id,
-                            uint64_t poll_tx_ts, uint64_t poll_rx_ts, uint64_t ans_tx_ts) 
+                            uint64_t poll_tx_ts, uint64_t poll_rx_ts, uint64_t ans_tx_ts)
 {
     uint8_t ans_msg[MEAS_ANS_FRAME_LENGTH];
     memset(&ans_msg[0], 0, MEAS_ANS_FRAME_LENGTH);
@@ -216,7 +216,7 @@ static void send_meas_ans(uint32_t target_id, uint32_t gateway_id,
 }
 
 static int send_meas_fin(uint32_t initiator_id, uint32_t gateway_id,
-                            uint64_t poll_tx_ts, uint64_t poll_rx_ts, uint64_t ans_tx_ts, uint64_t ans_rx_ts, uint64_t fin_tx_ts) 
+                            uint64_t poll_tx_ts, uint64_t poll_rx_ts, uint64_t ans_tx_ts, uint64_t ans_rx_ts, uint64_t fin_tx_ts)
 {
     uint8_t fin_msg[MEAS_FIN_FRAME_LENGTH];
     memset(&fin_msg[0], 0, MEAS_FIN_FRAME_LENGTH);
@@ -272,7 +272,7 @@ static int handle_meas_init(uint8_t *frame, uint16_t frame_length) {
     if (target_id != device_id) {
         LOG_INF("%s: received mes_init was not addressed to this device %08x vs %08x", __func__, target_id, device_id);
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
-        return -ECANCELED; 
+        return -ECANCELED;
     }
     memcpy(&gateway_id, &frame[6], sizeof(gateway_id));
     memcpy(&initiator_id, &frame[10], sizeof(initiator_id));
@@ -375,7 +375,7 @@ static int handle_meas_fin(uint8_t *frame, uint16_t frame_length) {
         return -ECANCELED;
     }
 
-    uint64_t fin_rx_ts;
+    uint64_t fin_rx_ts = 0;
     dwt_readrxtimestamp((uint8_t *)&fin_rx_ts);
     dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
@@ -389,13 +389,11 @@ static int handle_meas_fin(uint8_t *frame, uint16_t frame_length) {
     double Da = initiator_resp_time;
     double Db = responder_resp_time;
 
-    LOG_INF("%s: ra: %lf, rb: %lf, da: %lf, db: %lf", __func__, Ra, Rb, Da, Db);
-
     int64_t tof_dtu = (int64)((Ra * Rb - Da * Db) / (Ra + Rb + Da + Db));
     double tof = tof_dtu * DWT_TIME_UNITS;
     double distance = tof * SPEED_OF_LIGHT;
 
-    LOG_INF("%s: calibration finished with device %08x offset is tof_dtu: %lld at distance %lf", __func__, target_id, tof_dtu, distance);
+    LOG_INF("%s: measurement finished with device %08x offset is tof_dtu: %lld at distance %lf", __func__, target_id, tof_dtu, distance);
 
     return 0;
 }
@@ -471,7 +469,7 @@ static void tx_done_handler(const dwt_cb_data_t *cb_data) {
 }
 
 int start_measurement(const uint32_t target_id) {
-    rtls_role_t rtls_role = dev_mgmt_get_config()->rtls_role;    
+    rtls_role_t rtls_role = dev_mgmt_get_config()->rtls_role;
     uint32_t gateway_id = dev_mgmt_get_config()->device_id;
 
     int ret;
@@ -513,7 +511,7 @@ static int radio_init(void) {
     dwt_settxantennadelay(TX_ANT_DLY);
 
     dwt_setleds(1);
-    
+
     return 0;
 }
 
