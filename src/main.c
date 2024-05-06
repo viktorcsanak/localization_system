@@ -45,17 +45,20 @@ int main(void)
     //dw_twr_resp_main();
 
     uint8_t rtls_role = dev_mgmt_get_config()->rtls_role;
-    LOG_INF("Device booting as %d", rtls_role);
-    if (rtls_role == GATEWAY_ANCHOR) {
-        uint32_t target_id = 0x444a8ca3;
-        while (1) {
-            rc = start_measurement(target_id);
-            if (rc) {
-                LOG_ERR("%s: failed to start measurement %d", __func__, rc);
-            }
-            k_sleep(K_MSEC(1000));
-        }
+    uint32_t device_id = dev_mgmt_get_config()->device_id;
+    LOG_INF("Device %08x booting as %d", device_id, rtls_role);
+
+    if (rtls_role != TAG) {
+        return 0;
     }
 
-    return 0;
+    while (1) {
+        rc = start_measurement();
+        if (rc) {
+            LOG_ERR("%s: failed to start measurement %d", __func__, rc);
+        }
+        k_sleep(K_MSEC(1000));
+    }
+
+    return -1;
 }

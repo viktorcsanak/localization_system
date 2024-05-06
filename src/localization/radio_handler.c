@@ -1,4 +1,5 @@
 #include "include/radio_handler.h"
+#include "zephyr/sys/util.h"
 
 #include <device_config.h>
 
@@ -10,10 +11,12 @@
 #include <string.h>
 #include <sys/_stdint.h>
 #include <sys/errno.h>
-#include <zephyr/random/random.h>
 #include <zephyr/kernel.h>
+#include <zephyr/random/random.h>
+//#include <zephyr/dsp/dsp.h>
+
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(radio_handler, CONFIG_LOG_DEFAULT_LEVEL);
+LOG_MODULE_REGISTER(radio_handler, CONFIG_LOG_RADIO_HANDLER_LEVEL);
 
 #define TX_ANT_DLY 16436
 #define RX_ANT_DLY 16436
@@ -52,6 +55,70 @@ dwt_config_t config = {
     (129)            /* SFD timeout (preamble length + 1 + SFD length - PAC size). Used in RX only. */
 };
 
+K_FIFO_DEFINE(anchor_fifo);
+K_FIFO_DEFINE(meas_fifo);
+
+struct anchor_record {
+    void *fifo_reserved;
+    uint32_t anchor_id;
+    int64_t tof_dtu;
+};
+
+struct range_work_container {
+    struct k_work_delayable work;
+    struct anchor_record record;
+};
+
+static int send_meas_request(const uint32_t initiator_id);
+
+static void range_anchors(struct k_work *item) {
+    struct range_work_container *container = CONTAINER_OF(k_work_delayable_from_work(item), struct range_work_container, work);
+
+    send_meas_request(container->record.anchor_id);
+    LOG_INF("%s: got anchor record with device id %08x from FIFO", __func__, container->record.anchor_id);
+
+    k_free(container);
+}
+
+static void scan_timer_expiry(struct k_timer *timer) {
+    LOG_DBG("%s:", __func__);
+
+    if (k_fifo_is_empty(&anchor_fifo)) {
+        LOG_INF("%s: FIFO is empty", __func__);
+        return;
+    }
+
+    uint8_t cnt = 0;
+    while (!k_fifo_is_empty(&anchor_fifo)) {
+        struct range_work_container *container = k_calloc(1, sizeof(struct range_work_container));
+        
+        struct anchor_record *record = k_fifo_get(&anchor_fifo, K_NO_WAIT);
+        memcpy(&container->record, record, sizeof(struct anchor_record));
+        k_free(record);
+        
+        k_work_init_delayable(&container->work, range_anchors);
+        int ret = k_work_schedule(&container->work, K_MSEC(cnt * 100));
+        if (ret <= 0) {
+            LOG_WRN("%s: failed to schedule work item", __func__);
+            k_free(container);
+        }
+
+        cnt++;
+    }
+}
+
+K_TIMER_DEFINE(scan_timer, scan_timer_expiry, NULL);
+
+static void meas_timer_expiry(struct k_timer *timer) {
+    LOG_INF("%s:", __func__);
+
+    while (!k_fifo_is_empty(&meas_fifo)) {
+        k_free(k_fifo_get(&meas_fifo, K_NO_WAIT));
+    }
+}
+
+K_TIMER_DEFINE(meas_timer, meas_timer_expiry, NULL);
+
 static void isr_wrapper(void) {
     k_work_submit(&isr_work);
 }
@@ -79,7 +146,7 @@ static uint32_t device_id_sleep(void) {
     uint32_t device_id = dev_mgmt_get_config()->device_id;
     uint8_t rand;
     sys_csrand_get(&rand, sizeof(uint8_t));
-    return ((device_id % 743) + rand);
+    return ((device_id % 127) + rand);
 }
 
 static void tx_start(struct tx_data *tx_data) {
@@ -93,9 +160,9 @@ static void tx_start(struct tx_data *tx_data) {
 }
 
 static void tx_immediate(struct k_work *item) {
+    LOG_DBG("%s:", __func__);
     struct tx_container *container = CONTAINER_OF(item, struct tx_container, tx_work);
     struct tx_data *tx_data = &container->tx_data;
-    LOG_INF("%s:", __func__);
 
     tx_start(tx_data);
 
@@ -103,17 +170,17 @@ static void tx_immediate(struct k_work *item) {
 }
 
 static void tx_schedule(struct k_work *item) {
+    LOG_DBG("%s:", __func__);
     struct tx_schedule_container *container = CONTAINER_OF(k_work_delayable_from_work(item), struct tx_schedule_container, tx_work);
     struct tx_data *tx_data = &container->tx_data;
-    LOG_INF("%s:", __func__);
 
     tx_start(tx_data);
 
     k_free(container);
 }
 
-static int send_scan_init(void) {
-    LOG_INF("%s:", __func__);
+static int  send_scan_init(void) {
+    LOG_DBG("%s:", __func__);
     struct tx_container *container = (struct tx_container *)k_calloc(1, sizeof(struct tx_container));
     if (container == NULL) {
         LOG_ERR("%s: failed to allocate container", __func__);
@@ -141,7 +208,7 @@ static int send_scan_init(void) {
 }
 
 static int send_scan_resp(uint32_t target_id) {
-    LOG_INF("%s:", __func__);
+    LOG_DBG("%s:", __func__);
     struct tx_schedule_container *container = (struct tx_schedule_container *)k_calloc(1, sizeof(struct tx_schedule_container));
     if (container == NULL) {
         LOG_ERR("%s: failed to allocate container", __func__);
@@ -177,7 +244,7 @@ static int send_meas_request(const uint32_t initiator_id) {
         return -ENOMEM;
     }
 
-    LOG_INF("%s:", __func__);
+    LOG_DBG("%s:", __func__);
 
     struct tx_data *tx_data = &container->tx_data;
     tx_data->data_length = MEAS_REQ_FRAME_LENGTH;
@@ -274,7 +341,6 @@ static int send_meas_fin(uint32_t target_id, uint64_t poll_tx_ts, uint64_t poll_
 }
 
 static int handle_scan_init(uint8_t *frame, uint16_t frame_length) {
-    LOG_DBG("%s:", __func__);
     if (SCAN_INIT_FRAME_LENGTH != frame_length) {
         LOG_ERR("%s: read data length %d does not equal predefined %d", __func__, frame_length, SCAN_INIT_FRAME_LENGTH);
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
@@ -283,11 +349,13 @@ static int handle_scan_init(uint8_t *frame, uint16_t frame_length) {
 
     uint32_t target_id;
     memcpy(&target_id, &frame[2], sizeof(target_id));
+    
+    LOG_DBG("%s: received scan_init from %08x", __func__, target_id);
+
     return send_scan_resp(target_id);
 }
 
 static int handle_scan_resp(uint8_t *frame, uint16_t frame_length) {
-    LOG_DBG("%s:", __func__);
     if (SCAN_RESP_FRAME_LENGTH != frame_length) {
         LOG_ERR("%s: read data length %d does not equal predefined %d", __func__, frame_length, SCAN_RESP_FRAME_LENGTH);
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
@@ -299,12 +367,18 @@ static int handle_scan_resp(uint8_t *frame, uint16_t frame_length) {
     memcpy(&target_id, &frame[2], sizeof(target_id));
     memcpy(&initiator_id, &frame[6], sizeof(initiator_id));
     
+    LOG_DBG("%s: received scan_resp from %08x", __func__, initiator_id);
+
     if (device_id != target_id) {
         LOG_INF("%s: message was not addressed to this device %08x vs %08x", __func__, target_id, device_id);
         return -ECANCELED;
     }
 
-    //TODO: push initiator ID to FIFO and start scan timeout. When scan timeout expires, start sending meas_requests to anchors in FIFO.
+    k_timer_start(&scan_timer, K_MSEC(400), K_MSEC(0));
+
+    struct anchor_record *anchor_record = k_calloc(1, sizeof(struct anchor_record));
+    anchor_record->anchor_id = initiator_id;
+    k_fifo_put(&anchor_fifo, anchor_record);
 
     return 0;
 }
@@ -392,7 +466,7 @@ static int handle_meas_ans(uint8_t *frame, uint16_t frame_length) {
     uint32_t device_id = dev_mgmt_get_config()->device_id;
 
     if (device_id != initiator_id) {
-        LOG_INF("%s: meas_ans was not addressed to this device %08x vs %08x", __func__, device_id, initiator_id);
+        LOG_INF("%s: meas_ans was not addressed to this device %08x vs %08x", __func__, initiator_id, device_id);
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
         return -ECANCELED;
     }
@@ -428,7 +502,7 @@ static int handle_meas_fin(uint8_t *frame, uint16_t frame_length) {
     memcpy(&fin_tx_ts, &frame[30], 5 * sizeof(uint8_t));
 
     uint32_t device_id = dev_mgmt_get_config()->device_id;
-    LOG_INF("%s:", __func__);
+    LOG_DBG("%s:", __func__);
 
     if (device_id != target_id) {
         LOG_INF("%s: meas_fin was not addressed to this device %08x vs %08x", __func__, device_id, target_id);
@@ -454,7 +528,14 @@ static int handle_meas_fin(uint8_t *frame, uint16_t frame_length) {
     double tof = tof_dtu * DWT_TIME_UNITS;
     double distance = tof * SPEED_OF_LIGHT;
 
-    LOG_INF("%s: measurement finished with device %08x offset is tof_dtu: %lld at distance %lf", __func__, target_id, tof_dtu, distance);
+    struct anchor_record *record = k_calloc(1, sizeof(struct anchor_record));
+    record->anchor_id = initiator_id;
+    record->tof_dtu = tof_dtu;
+    k_fifo_put(&meas_fifo, record);
+
+    k_timer_start(&meas_timer, K_MSEC(120), K_MSEC(0));
+
+    LOG_INF("%s: measurement finished with device %08x offset is tof_dtu: %lld at distance %lf", __func__, initiator_id, tof_dtu, distance);
 
     return 0;
 }
@@ -529,27 +610,10 @@ static void tx_done_handler(const dwt_cb_data_t *cb_data) {
     LOG_DBG("%s:", __func__);
 }
 
-int start_measurement(const uint32_t target_id) {
-    rtls_role_t rtls_role = dev_mgmt_get_config()->rtls_role;
-    uint32_t gateway_id = dev_mgmt_get_config()->device_id;
+int start_measurement(void) {
+    send_scan_init();
 
-    int ret;
-    if (rtls_role == TAG) {
-        LOG_ERR("%s: not supported for tags", __func__);
-        return -ENOTSUP;
-    } else if (rtls_role == GATEWAY_ANCHOR) {
-        ret = send_meas_request(target_id);
-        if (ret) {
-            LOG_ERR("%s: failed to send measurement request %d", __func__, ret);
-            return ret;
-        }
-    }
-
-    ret = send_meas_init(target_id, gateway_id);
-    if (ret) {
-        LOG_ERR("%s: failed to send measurement init %d", __func__, ret);
-        return ret;
-    }
+    k_timer_start(&scan_timer, K_MSEC(400), K_MSEC(0));
 
     return 0;
 }
@@ -583,7 +647,7 @@ int radio_handler_init(void) {
     }
 
     k_work_init(&isr_work, isr_handler);
-
+    
     dwt_setcallbacks(tx_done_handler, rx_ok_handler, rx_timeout_handler, rx_error_handler);
 
     port_set_deca_isr(isr_wrapper);
@@ -596,6 +660,7 @@ int radio_handler_init(void) {
 
     uint32_t partid = dwt_getpartid();
     LOG_INF("%s: partid: %08x", __func__, partid);
+
 
     return 0;
 }
