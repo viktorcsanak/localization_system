@@ -16,6 +16,9 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(main, CONFIG_LOG_DEFAULT_LEVEL);
 
+extern int dw_twr_resp_main(void);
+extern int dw_twr_init_main(void);
+
 int main(void)
 {
     int rc = dev_mgmt_config_init();
@@ -38,17 +41,24 @@ int main(void)
         return rc;
     }
 
+    //dw_twr_init_main();
+    //dw_twr_resp_main();
+
     uint8_t rtls_role = dev_mgmt_get_config()->rtls_role;
-    if (rtls_role == GATEWAY_ANCHOR) {
-        uint32_t target_id = 0x24fda3a0;
-        while (1) {
-            rc = start_measurement(target_id);
-            if (rc) {
-                LOG_ERR("%s: failed to start measurement %d", __func__, rc);
-            }
-            k_sleep(K_MSEC(5000));
-        }
+    uint32_t device_id = dev_mgmt_get_config()->device_id;
+    LOG_INF("Device %08x booting as %d", device_id, rtls_role);
+
+    if (rtls_role != TAG) {
+        return 0;
     }
 
-    return 0;
+    while (1) {
+        rc = start_measurement();
+        if (rc) {
+            LOG_ERR("%s: failed to start measurement %d", __func__, rc);
+        }
+        k_sleep(K_MSEC(1000));
+    }
+
+    return -1;
 }

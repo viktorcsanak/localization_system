@@ -81,7 +81,7 @@ int dev_mgmt_bt_start_advertising(void) {
 
     scan_data->type = BT_DATA_NAME_COMPLETE;
     scan_data->data_len = data_len;
-    memset(&device_data[0], data_len, 0);
+    memset(&device_data[0], 0, data_len);
     sprintf(&device_data[0], "Anchor_%8x", unique_id);
     scan_data->data = &device_data[0];
 
