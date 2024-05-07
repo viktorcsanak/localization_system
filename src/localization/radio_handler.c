@@ -13,7 +13,12 @@
 #include <sys/errno.h>
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
-//#include <zephyr/dsp/dsp.h>
+
+#include "arm_math_types.h"
+#include "dsp/matrix_functions.h"
+#include "zephyr/dsp/types.h"
+#include "zephyr/sys/printk.h"
+#include <zephyr/dsp/dsp.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(radio_handler, CONFIG_LOG_RADIO_HANDLER_LEVEL);
@@ -75,7 +80,7 @@ static void range_anchors(struct k_work *item) {
     struct range_work_container *container = CONTAINER_OF(k_work_delayable_from_work(item), struct range_work_container, work);
 
     send_meas_request(container->record.anchor_id);
-    LOG_INF("%s: got anchor record with device id %08x from FIFO", __func__, container->record.anchor_id);
+    LOG_DBG("%s: got anchor record with device id %08x from FIFO", __func__, container->record.anchor_id);
 
     k_free(container);
 }
@@ -110,11 +115,74 @@ static void scan_timer_expiry(struct k_timer *timer) {
 K_TIMER_DEFINE(scan_timer, scan_timer_expiry, NULL);
 
 static void meas_timer_expiry(struct k_timer *timer) {
-    LOG_INF("%s:", __func__);
-
-    while (!k_fifo_is_empty(&meas_fifo)) {
-        k_free(k_fifo_get(&meas_fifo, K_NO_WAIT));
+    LOG_DBG("%s:", __func__);
+    struct anchor_record *meas_records[16];
+    for (int off = 0; off < ARRAY_SIZE(meas_records); off++) {
+        meas_records[off] = NULL;
     }
+    
+    uint8_t meas_off_cnt = 0;
+    while (!k_fifo_is_empty(&meas_fifo)) {
+        meas_records[meas_off_cnt] = k_fifo_get(&meas_fifo, K_NO_WAIT);
+        meas_off_cnt++;
+    }
+
+    float32_t *b32_mat_data = k_calloc(meas_off_cnt, sizeof(float32_t));
+    float32_t *a32_mat_data = k_calloc(3 * meas_off_cnt, sizeof(float32_t));
+    float32_t *a32_mat_trans_data = k_calloc(3 * meas_off_cnt, sizeof(float32_t));
+    float32_t *a32_mat_trans_product_data = k_calloc(9, sizeof(float32_t));
+    float32_t *a32_mat_trans_product_inv_data = k_calloc(9, sizeof(float32_t));
+    float32_t *a32_mat_cross_data = k_calloc(3 * meas_off_cnt, sizeof(float32_t));
+    float32_t *eta32_vect_data = k_calloc(3, sizeof(float32_t));
+
+     for (int off = 0; off < meas_off_cnt; off++) {
+        float64_t x = 0.0, y = 0.0;
+        if (meas_records[off]->anchor_id == 0x444a8ca3) {
+            x = 0.0;
+            y = 0.0;
+        } else if (meas_records[off]->anchor_id == 0xcabb41cd) {
+            x = 0.0;
+            y = 0.51;
+        }
+        else if (meas_records[off]->anchor_id == 0xa2a84b86) {
+            x = 0.34;
+            y = 0.0;
+        }
+
+        a32_mat_data[off * 3] = 1.0;
+        a32_mat_data[(off * 3) + 1] = -2 * x;
+        a32_mat_data[(off * 3) + 2] = -2 * y;
+
+        float32_t distance = (meas_records[off]->tof_dtu * DWT_TIME_UNITS) * SPEED_OF_LIGHT;
+        b32_mat_data[off] = (float32_t)((distance * distance) -(x * x) -(y * y));
+        k_free(meas_records[off]);
+    }
+
+    arm_matrix_instance_f32 b32_mat, a32_mat, a32_mat_trans, a32_mat_trans_product, a32_mat_trans_product_inv, a32_mat_cross, eta32_vect;
+    arm_mat_init_f32(&a32_mat, meas_off_cnt, 3, a32_mat_data);
+    arm_mat_init_f32(&a32_mat_trans, 3, meas_off_cnt, a32_mat_trans_data);
+    arm_mat_init_f32(&a32_mat_trans_product, 3, 3, a32_mat_trans_product_data);
+    arm_mat_init_f32(&a32_mat_trans_product_inv, 3, 3, a32_mat_trans_product_inv_data);
+    arm_mat_init_f32(&a32_mat_cross, 3, meas_off_cnt, a32_mat_cross_data);
+    arm_mat_init_f32(&eta32_vect, 3, 1, eta32_vect_data);
+    arm_mat_init_f32(&b32_mat, meas_off_cnt, 1, b32_mat_data);
+
+    arm_mat_trans_f32(&a32_mat, &a32_mat_trans);
+
+    arm_mat_mult_f32(&a32_mat_trans, &a32_mat, &a32_mat_trans_product);
+    arm_mat_inverse_f32(&a32_mat_trans_product, &a32_mat_trans_product_inv);
+    arm_mat_mult_f32(&a32_mat_trans_product_inv, &a32_mat_trans, &a32_mat_cross);
+
+    arm_mat_mult_f32(&a32_mat_cross, &b32_mat, &eta32_vect);
+
+    LOG_INF("%s: position results are x: %f y: %f", __func__, eta32_vect.pData[1], eta32_vect.pData[2]);
+    k_free(a32_mat_data);
+    k_free(a32_mat_trans_data);
+    k_free(a32_mat_trans_product_data);
+    k_free(a32_mat_trans_product_inv_data);
+    k_free(a32_mat_cross_data);
+    k_free(eta32_vect_data);
+    k_free(b32_mat_data);
 }
 
 K_TIMER_DEFINE(meas_timer, meas_timer_expiry, NULL);
